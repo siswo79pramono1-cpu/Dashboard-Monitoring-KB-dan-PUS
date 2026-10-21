@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import os
 from datetime import datetime
-import json
+from io import BytesIO
 
 # ==================== PAGE CONFIG ====================
 st.set_page_config(
@@ -44,47 +44,6 @@ st.markdown("""
         font-size: 0.95rem;
     }
     
-    .metric-box {
-        background: white;
-        border-radius: 14px;
-        padding: 1.2rem 1.4rem;
-        box-shadow: 0 4px 20px rgba(0,0,0,0.06);
-        border: 1px solid #eef2f6;
-        text-align: center;
-        transition: transform 0.2s;
-    }
-    .metric-box:hover {
-        transform: translateY(-3px);
-        box-shadow: 0 8px 30px rgba(0,0,0,0.1);
-    }
-    .metric-value {
-        font-size: 1.85rem;
-        font-weight: 700;
-        color: #0f2027;
-        margin: 0.3rem 0;
-    }
-    .metric-label {
-        font-size: 0.8rem;
-        color: #64748b;
-        font-weight: 500;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-    }
-    .metric-delta {
-        font-size: 0.85rem;
-        color: #10b981;
-        font-weight: 600;
-    }
-    
-    .section-card {
-        background: white;
-        border-radius: 14px;
-        padding: 1.5rem;
-        box-shadow: 0 4px 20px rgba(0,0,0,0.05);
-        border: 1px solid #eef2f6;
-        margin-bottom: 1.2rem;
-    }
-    
     div[data-testid="stMetricValue"] {
         font-size: 1.7rem !important;
         font-weight: 700 !important;
@@ -106,10 +65,6 @@ st.markdown("""
         background: white !important;
         color: #0f2027 !important;
         box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-    }
-    
-    .sidebar .sidebar-content {
-        background: #0f2027;
     }
     
     [data-testid="stSidebar"] {
@@ -153,7 +108,6 @@ BULAN_NAMA = {
     9: "September", 10: "Oktober", 11: "November", 12: "Desember"
 }
 
-# Koordinat Kecamatan Kabupaten Batang (approx)
 KOORDINAT_KECAMATAN = {
     "Batang": {"lat": -6.908, "lon": 109.730},
     "Warungasem": {"lat": -6.945, "lon": 109.695},
@@ -218,11 +172,78 @@ def filter_df(df, tahun, bulan_list, kecamatan):
         mask = mask & (df["kecamatan"] == kecamatan)
     return df[mask]
 
+def import_sheet_data(df_import, key, required_cols):
+    """Import data from dataframe, overwrite matching keys"""
+    if df_import.empty:
+        return 0, "Data kosong"
+    
+    # Normalize column names
+    df_import.columns = [str(c).strip().lower() for c in df_import.columns]
+    
+    missing = [c for c in required_cols if c not in df_import.columns]
+    if missing:
+        return 0, f"Kolom wajib tidak ditemukan: {', '.join(missing)}"
+    
+    df_import = df_import[required_cols].copy()
+    
+    # Clean
+    if "desa" in df_import.columns:
+        df_import["desa"] = df_import["desa"].fillna("").astype(str).str.strip()
+        df_import.loc[df_import["desa"].isin(["nan", "None", ""]), "desa"] = ""
+    
+    for col in ["tahun", "bulan"]:
+        if col in df_import.columns:
+            df_import[col] = pd.to_numeric(df_import[col], errors="coerce")
+    
+    if "jumlah" in df_import.columns:
+        df_import["jumlah"] = pd.to_numeric(df_import["jumlah"], errors="coerce").fillna(0).astype(int)
+    if "jumlah_pus" in df_import.columns:
+        df_import["jumlah_pus"] = pd.to_numeric(df_import["jumlah_pus"], errors="coerce").fillna(0).astype(int)
+    if "jumlah_pra_ks" in df_import.columns:
+        df_import["jumlah_pra_ks"] = pd.to_numeric(df_import["jumlah_pra_ks"], errors="coerce").fillna(0).astype(int)
+    
+    df_import = df_import.dropna(subset=["tahun", "bulan", "kecamatan"])
+    df_import["tahun"] = df_import["tahun"].astype(int)
+    df_import["bulan"] = df_import["bulan"].astype(int)
+    df_import["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    existing = load_data(key)
+    
+    if existing.empty:
+        save_data(key, df_import)
+        return len(df_import), "Berhasil"
+    
+    # Remove overlapping records
+    if key in ["pus", "pra_ks"]:
+        merge_keys = ["tahun", "bulan", "kecamatan", "desa"]
+    elif key in ["kb_total", "kb_baru"]:
+        merge_keys = ["tahun", "bulan", "kecamatan", "desa", "metode"]
+    else:  # pus_bukan_kb
+        merge_keys = ["tahun", "bulan", "kecamatan", "desa", "status_hamil", "keinginan"]
+    
+    # Ensure desa exists
+    for d in [existing, df_import]:
+        if "desa" not in d.columns:
+            d["desa"] = ""
+        d["desa"] = d["desa"].fillna("").astype(str)
+    
+    # Build mask to remove old matching rows
+    existing["_key"] = existing.apply(lambda r: tuple(str(r[k]) for k in merge_keys if k in existing.columns), axis=1)
+    df_import["_key"] = df_import.apply(lambda r: tuple(str(r[k]) for k in merge_keys if k in df_import.columns), axis=1)
+    
+    keys_to_replace = set(df_import["_key"].tolist())
+    existing = existing[~existing["_key"].isin(keys_to_replace)].drop(columns=["_key"], errors="ignore")
+    df_import = df_import.drop(columns=["_key"], errors="ignore")
+    
+    combined = pd.concat([existing, df_import], ignore_index=True)
+    save_data(key, combined)
+    return len(df_import), "Berhasil"
+
 # ==================== HEADER ====================
 st.markdown("""
 <div class="main-header">
     <h1>👨‍👩‍👧‍👦 Sistem Monitoring Keluarga Berencana & PUS</h1>
-    <p>Input Data • Dashboard Analitik • Visualisasi Spasial • Multi-Periode</p>
+    <p>Input Data • Dashboard Analitik • Visualisasi Spasial • Import Excel • Multi-Periode</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -235,7 +256,7 @@ with st.sidebar:
         label_visibility="collapsed"
     )
     st.markdown("---")
-    st.caption("v2.0 • Siap Deploy Online")
+    st.caption("v2.1 • Import Excel + Spasial")
     st.caption("Data tersimpan lokal / cloud")
 
 # ==================== MENU: INPUT DATA ====================
@@ -428,7 +449,6 @@ elif menu == "📊 Dashboard":
     
     st.markdown(f"#### 📅 {periode_label} {filter_tahun}" + (f" · {filter_kec}" if filter_kec != "Semua" else " · Semua Kecamatan"))
     
-    # Load data
     df_pus = load_data("pus")
     df_kb_t = load_data("kb_total")
     df_kb_b = load_data("kb_baru")
@@ -448,7 +468,6 @@ elif menu == "📊 Dashboard":
     total_bukan = int(bukan_f["jumlah"].sum()) if not bukan_f.empty else 0
     coverage = (total_kb / total_pus * 100) if total_pus > 0 else 0
     
-    # Metrics
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Total PUS", f"{total_pus:,}")
     m2.metric("KB Aktif", f"{total_kb:,}", delta=f"{coverage:.1f}% coverage" if total_pus else None)
@@ -490,7 +509,6 @@ elif menu == "📊 Dashboard":
         else:
             st.info("Belum ada data Peserta KB Baru")
     
-    # PUS Bukan KB
     st.markdown("##### 🚫 Detail PUS Bukan Peserta KB")
     if not bukan_f.empty:
         b1, b2 = st.columns(2)
@@ -509,7 +527,6 @@ elif menu == "📊 Dashboard":
     else:
         st.info("Belum ada data PUS Bukan KB")
     
-    # Perbandingan kecamatan
     if filter_kec == "Semua" and not pus_f.empty:
         st.markdown("##### 📍 Perbandingan antar Kecamatan")
         kec_p = pus_f.groupby("kecamatan")["jumlah_pus"].sum().reset_index()
@@ -563,14 +580,12 @@ elif menu == "🗺️ Peta Spasial":
     
     st.markdown(f"**Periode peta:** {map_label} {map_tahun}")
     
-    # Load & aggregate
     df_pus = load_data("pus")
     df_kb = load_data("kb_total")
     
     pus_map = filter_df(df_pus, map_tahun, map_bulan, "Semua")
     kb_map = filter_df(df_kb, map_tahun, map_bulan, "Semua")
     
-    # Build map data
     rows = []
     for kec, coord in KOORDINAT_KECAMATAN.items():
         p = int(pus_map[pus_map["kecamatan"]==kec]["jumlah_pus"].sum()) if not pus_map.empty else 0
@@ -587,7 +602,6 @@ elif menu == "🗺️ Peta Spasial":
     
     map_df = pd.DataFrame(rows)
     
-    # Metric summary
     c1, c2, c3 = st.columns(3)
     c1.metric("Total PUS (Peta)", f"{map_df['jumlah_pus'].sum():,}")
     c2.metric("Total KB Aktif", f"{map_df['kb_aktif'].sum():,}")
@@ -596,7 +610,6 @@ elif menu == "🗺️ Peta Spasial":
     
     st.markdown("---")
     
-    # Map type selector
     map_metric = st.radio("Tampilkan di peta berdasarkan:", 
                           ["Jumlah PUS", "Peserta KB Aktif", "Coverage (%)"], horizontal=True)
     
@@ -610,7 +623,6 @@ elif menu == "🗺️ Peta Spasial":
         size_col, color_col, title = "coverage", "coverage", "Coverage KB (%) per Kecamatan"
         color_scale = "RdYlGn"
     
-    # Create map
     fig = px.scatter_map(
         map_df,
         lat="lat",
@@ -630,23 +642,16 @@ elif menu == "🗺️ Peta Spasial":
         zoom=9.5,
         title=title,
         map_style="open-street-map",
-        height=520
+        height=520,
+        center={"lat": -7.0, "lon": 109.85}
     )
     fig.update_layout(
         margin=dict(l=0, r=0, t=40, b=0),
         coloraxis_colorbar=dict(title=map_metric)
     )
-    # Center on Batang
-    fig.update_layout(
-    map=dict(
-        center=dict(lat=-7.0, lon=109.85),
-        zoom=9.5
-    )
-)
     
     st.plotly_chart(fig, use_container_width=True)
     
-    # Table under map
     with st.expander("📋 Data Tabel per Kecamatan", expanded=False):
         st.dataframe(
             map_df[["kecamatan", "jumlah_pus", "kb_aktif", "coverage"]]
@@ -711,60 +716,159 @@ elif menu == "📍 Manajemen Wilayah":
 
 # ==================== MENU: DATA & EXPORT ====================
 elif menu == "📁 Data & Export":
-    st.subheader("📁 Data Tersimpan & Export")
+    st.subheader("📁 Data Tersimpan, Export & Import Excel")
     
-    choice = st.selectbox("Pilih Jenis Data", [
-        "Jumlah PUS", "Peserta KB Total", "Peserta KB Baru",
-        "Keluarga Pra KS", "PUS Bukan Peserta KB"
-    ])
+    tab_view, tab_import = st.tabs(["📋 Lihat & Export Data", "📥 Import dari Excel"])
     
-    key_map = {
-        "Jumlah PUS": "pus",
-        "Peserta KB Total": "kb_total",
-        "Peserta KB Baru": "kb_baru",
-        "Keluarga Pra KS": "pra_ks",
-        "PUS Bukan Peserta KB": "pus_bukan_kb"
-    }
+    with tab_view:
+        choice = st.selectbox("Pilih Jenis Data", [
+            "Jumlah PUS", "Peserta KB Total", "Peserta KB Baru",
+            "Keluarga Pra KS", "PUS Bukan Peserta KB"
+        ])
+        
+        key_map = {
+            "Jumlah PUS": "pus",
+            "Peserta KB Total": "kb_total",
+            "Peserta KB Baru": "kb_baru",
+            "Keluarga Pra KS": "pra_ks",
+            "PUS Bukan Peserta KB": "pus_bukan_kb"
+        }
+        
+        df = load_data(key_map[choice])
+        
+        if df.empty:
+            st.warning("Belum ada data tersimpan.")
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                years = sorted(df["tahun"].unique().tolist()) if "tahun" in df.columns else []
+                f_tahun = st.multiselect("Filter Tahun", years, default=years[-1:] if years else [])
+            with c2:
+                kecs = sorted(df["kecamatan"].unique().tolist()) if "kecamatan" in df.columns else []
+                f_kec = st.multiselect("Filter Kecamatan", kecs)
+            
+            filtered = df.copy()
+            if f_tahun:
+                filtered = filtered[filtered["tahun"].isin(f_tahun)]
+            if f_kec:
+                filtered = filtered[filtered["kecamatan"].isin(f_kec)]
+            
+            st.dataframe(filtered, use_container_width=True, hide_index=True)
+            
+            csv = filtered.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download CSV",
+                data=csv,
+                file_name=f"{key_map[choice]}_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+            
+            with st.expander("⚠️ Hapus Data"):
+                st.warning("Tindakan ini tidak dapat dibatalkan.")
+                if st.button("Hapus SEMUA data jenis ini"):
+                    save_data(key_map[choice], pd.DataFrame())
+                    st.success("Data dihapus.")
+                    st.rerun()
     
-    df = load_data(key_map[choice])
-    
-    if df.empty:
-        st.warning("Belum ada data tersimpan.")
-    else:
-        c1, c2 = st.columns(2)
-        with c1:
-            years = sorted(df["tahun"].unique().tolist()) if "tahun" in df.columns else []
-            f_tahun = st.multiselect("Filter Tahun", years, default=years[-1:] if years else [])
-        with c2:
-            kecs = sorted(df["kecamatan"].unique().tolist()) if "kecamatan" in df.columns else []
-            f_kec = st.multiselect("Filter Kecamatan", kecs)
+    with tab_import:
+        st.markdown("### 📥 Import Data dari Excel")
+        st.info("Gunakan template resmi agar format kolom sesuai. Data dengan tahun+bulan+kecamatan yang sama akan **ditimpa**.")
         
-        filtered = df.copy()
-        if f_tahun:
-            filtered = filtered[filtered["tahun"].isin(f_tahun)]
-        if f_kec:
-            filtered = filtered[filtered["kecamatan"].isin(f_kec)]
+        # Download template
+        template_path = "Template_Import_Data_KB.xlsx"
+        if os.path.exists(template_path):
+            with open(template_path, "rb") as f:
+                st.download_button(
+                    "📄 Download Template Excel",
+                    data=f.read(),
+                    file_name="Template_Import_Data_KB.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary"
+                )
+        else:
+            st.warning("Template belum tersedia di server. Download dari file yang sudah disediakan.")
         
-        st.dataframe(filtered, use_container_width=True, hide_index=True)
+        st.markdown("---")
+        st.markdown("##### Upload File Excel")
         
-        csv = filtered.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Download CSV",
-            data=csv,
-            file_name=f"{key_map[choice]}_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv"
-        )
+        uploaded = st.file_uploader("Pilih file Excel (.xlsx)", type=["xlsx", "xls"])
         
-        with st.expander("⚠️ Hapus Data"):
-            st.warning("Tindakan ini tidak dapat dibatalkan.")
-            if st.button("Hapus SEMUA data jenis ini"):
-                save_data(key_map[choice], pd.DataFrame())
-                st.success("Data dihapus.")
-                st.rerun()
+        if uploaded is not None:
+            try:
+                xls = pd.ExcelFile(uploaded)
+                sheet_names = xls.sheet_names
+                st.success(f"File terbaca. Sheet tersedia: {', '.join(sheet_names)}")
+                
+                # Mapping sheet name to key
+                sheet_map = {
+                    "PUS": ("pus", ["tahun", "bulan", "kecamatan", "desa", "jumlah_pus"]),
+                    "KB_TOTAL": ("kb_total", ["tahun", "bulan", "kecamatan", "desa", "metode", "jumlah"]),
+                    "KB_BARU": ("kb_baru", ["tahun", "bulan", "kecamatan", "desa", "metode", "jumlah"]),
+                    "PRA_KS": ("pra_ks", ["tahun", "bulan", "kecamatan", "desa", "jumlah_pra_ks"]),
+                    "PUS_BUKAN_KB": ("pus_bukan_kb", ["tahun", "bulan", "kecamatan", "desa", "status_hamil", "keinginan", "jumlah"]),
+                }
+                
+                available = [s for s in sheet_names if s.upper() in [k.upper() for k in sheet_map.keys()] or s in sheet_map]
+                
+                if not available:
+                    # Try flexible matching
+                    available = [s for s in sheet_names if s != "PETUNJUK"]
+                
+                selected_sheets = st.multiselect(
+                    "Pilih sheet yang ingin diimport",
+                    options=sheet_names,
+                    default=[s for s in sheet_names if s != "PETUNJUK"]
+                )
+                
+                if selected_sheets and st.button("🚀 Proses Import", type="primary"):
+                    results = []
+                    for sheet in selected_sheets:
+                        df_sheet = pd.read_excel(uploaded, sheet_name=sheet)
+                        
+                        # Find matching key
+                        key = None
+                        req_cols = None
+                        sheet_upper = sheet.upper().replace(" ", "_")
+                        for sk, (k, cols) in sheet_map.items():
+                            if sk.upper() == sheet_upper or sk.upper() in sheet_upper:
+                                key = k
+                                req_cols = cols
+                                break
+                        
+                        if key is None:
+                            # Heuristic
+                            cols_lower = [c.lower() for c in df_sheet.columns]
+                            if "jumlah_pus" in cols_lower:
+                                key, req_cols = "pus", ["tahun", "bulan", "kecamatan", "desa", "jumlah_pus"]
+                            elif "jumlah_pra_ks" in cols_lower:
+                                key, req_cols = "pra_ks", ["tahun", "bulan", "kecamatan", "desa", "jumlah_pra_ks"]
+                            elif "status_hamil" in cols_lower:
+                                key, req_cols = "pus_bukan_kb", ["tahun", "bulan", "kecamatan", "desa", "status_hamil", "keinginan", "jumlah"]
+                            elif "metode" in cols_lower:
+                                # Could be total or baru - default total
+                                key, req_cols = "kb_total", ["tahun", "bulan", "kecamatan", "desa", "metode", "jumlah"]
+                            else:
+                                results.append(f"❌ Sheet **{sheet}**: format tidak dikenali")
+                                continue
+                        
+                        count, msg = import_sheet_data(df_sheet, key, req_cols)
+                        if msg == "Berhasil":
+                            results.append(f"✅ Sheet **{sheet}** → {key}: {count} baris berhasil diimport")
+                        else:
+                            results.append(f"❌ Sheet **{sheet}**: {msg}")
+                    
+                    for r in results:
+                        st.write(r)
+                    
+                    st.balloons()
+                    st.success("Proses import selesai. Silakan cek di menu Dashboard / Data.")
+                    
+            except Exception as e:
+                st.error(f"Gagal membaca file: {e}")
 
 # Footer
 st.markdown("""
 <div class="footer">
-    Sistem Monitoring KB & PUS · v2.0 · Siap Deploy ke Streamlit Cloud
+    Sistem Monitoring KB & PUS · v2.1 · Import Excel + Peta Spasial · Siap Deploy
 </div>
 """, unsafe_allow_html=True)
