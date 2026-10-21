@@ -172,6 +172,14 @@ def filter_df(df, tahun, bulan_list, kecamatan):
         mask = mask & (df["kecamatan"] == kecamatan)
     return df[mask]
 
+def get_stock_df(df, tahun, bulan_list, kecamatan):
+    """Untuk data stok/akumulasi: ambil bulan terakhir yang tersedia dalam periode."""
+    filtered = filter_df(df, tahun, bulan_list, kecamatan)
+    if filtered.empty or "bulan" not in filtered.columns:
+        return filtered
+    latest = int(filtered["bulan"].max())
+    return filtered[filtered["bulan"] == latest]
+
 def import_sheet_data(df_import, key, required_cols):
     """Import data from dataframe, overwrite matching keys"""
     if df_import.empty:
@@ -455,17 +463,29 @@ elif menu == "📊 Dashboard":
     df_pra = load_data("pra_ks")
     df_bukan = load_data("pus_bukan_kb")
     
-    pus_f = filter_df(df_pus, filter_tahun, filter_periode, filter_kec)
-    kbt_f = filter_df(df_kb_t, filter_tahun, filter_periode, filter_kec)
-    kbb_f = filter_df(df_kb_b, filter_tahun, filter_periode, filter_kec)
-    pra_f = filter_df(df_pra, filter_tahun, filter_periode, filter_kec)
-    bukan_f = filter_df(df_bukan, filter_tahun, filter_periode, filter_kec)
+    # Data stok/akumulasi: ambil bulan terakhir dalam periode (bukan dijumlah per bulan)
+    # Data aliran (KB Baru): dijumlahkan sepanjang periode
+    is_multi = len(filter_periode) > 1
     
-    total_pus = int(pus_f["jumlah_pus"].sum()) if not pus_f.empty else 0
-    total_kb = int(kbt_f["jumlah"].sum()) if not kbt_f.empty else 0
-    total_baru = int(kbb_f["jumlah"].sum()) if not kbb_f.empty else 0
-    total_pra = int(pra_f["jumlah_pra_ks"].sum()) if not pra_f.empty else 0
-    total_bukan = int(bukan_f["jumlah"].sum()) if not bukan_f.empty else 0
+    if is_multi:
+        pus_f = get_stock_df(df_pus, filter_tahun, filter_periode, filter_kec)
+        kbt_f = get_stock_df(df_kb_t, filter_tahun, filter_periode, filter_kec)
+        pra_f = get_stock_df(df_pra, filter_tahun, filter_periode, filter_kec)
+        bukan_f = get_stock_df(df_bukan, filter_tahun, filter_periode, filter_kec)
+        kbb_f = filter_df(df_kb_b, filter_tahun, filter_periode, filter_kec)  # flow = sum
+        st.caption(f"📌 Mode periode multi-bulan: Data stok (PUS, KB Aktif, Pra KS, PUS Bukan KB) menampilkan **posisi bulan terakhir** dalam periode. KB Baru dijumlahkan sepanjang periode.")
+    else:
+        pus_f = filter_df(df_pus, filter_tahun, filter_periode, filter_kec)
+        kbt_f = filter_df(df_kb_t, filter_tahun, filter_periode, filter_kec)
+        kbb_f = filter_df(df_kb_b, filter_tahun, filter_periode, filter_kec)
+        pra_f = filter_df(df_pra, filter_tahun, filter_periode, filter_kec)
+        bukan_f = filter_df(df_bukan, filter_tahun, filter_periode, filter_kec)
+    
+    total_pus = int(pus_f["jumlah_pus"].sum()) if not pus_f.empty and "jumlah_pus" in pus_f.columns else 0
+    total_kb = int(kbt_f["jumlah"].sum()) if not kbt_f.empty and "jumlah" in kbt_f.columns else 0
+    total_baru = int(kbb_f["jumlah"].sum()) if not kbb_f.empty and "jumlah" in kbb_f.columns else 0
+    total_pra = int(pra_f["jumlah_pra_ks"].sum()) if not pra_f.empty and "jumlah_pra_ks" in pra_f.columns else 0
+    total_bukan = int(bukan_f["jumlah"].sum()) if not bukan_f.empty and "jumlah" in bukan_f.columns else 0
     coverage = (total_kb / total_pus * 100) if total_pus > 0 else 0
     
     m1, m2, m3, m4, m5 = st.columns(5)
@@ -583,8 +603,13 @@ elif menu == "🗺️ Peta Spasial":
     df_pus = load_data("pus")
     df_kb = load_data("kb_total")
     
-    pus_map = filter_df(df_pus, map_tahun, map_bulan, "Semua")
-    kb_map = filter_df(df_kb, map_tahun, map_bulan, "Semua")
+    # Multi-bulan: ambil posisi bulan terakhir (stok)
+    if len(map_bulan) > 1:
+        pus_map = get_stock_df(df_pus, map_tahun, map_bulan, "Semua")
+        kb_map = get_stock_df(df_kb, map_tahun, map_bulan, "Semua")
+    else:
+        pus_map = filter_df(df_pus, map_tahun, map_bulan, "Semua")
+        kb_map = filter_df(df_kb, map_tahun, map_bulan, "Semua")
     
     rows = []
     for kec, coord in KOORDINAT_KECAMATAN.items():
@@ -825,28 +850,39 @@ elif menu == "📁 Data & Export":
                     for sheet in selected_sheets:
                         df_sheet = pd.read_excel(uploaded, sheet_name=sheet)
                         
-                        # Find matching key
+                        # Find matching key — exact match first, then longest contains
                         key = None
                         req_cols = None
                         sheet_upper = sheet.upper().replace(" ", "_")
+                        
+                        # 1) Exact match
                         for sk, (k, cols) in sheet_map.items():
-                            if sk.upper() == sheet_upper or sk.upper() in sheet_upper:
-                                key = k
-                                req_cols = cols
+                            if sk.upper() == sheet_upper:
+                                key, req_cols = k, cols
                                 break
                         
+                        # 2) Longest partial match
                         if key is None:
-                            # Heuristic
-                            cols_lower = [c.lower() for c in df_sheet.columns]
-                            if "jumlah_pus" in cols_lower:
-                                key, req_cols = "pus", ["tahun", "bulan", "kecamatan", "desa", "jumlah_pus"]
+                            candidates = sorted(sheet_map.items(), key=lambda x: -len(x[0]))
+                            for sk, (k, cols) in candidates:
+                                if sk.upper() in sheet_upper or sheet_upper in sk.upper():
+                                    key, req_cols = k, cols
+                                    break
+                        
+                        # 3) Heuristic by columns
+                        if key is None:
+                            cols_lower = [str(c).lower() for c in df_sheet.columns]
+                            if "status_hamil" in cols_lower or "keinginan" in cols_lower:
+                                key, req_cols = "pus_bukan_kb", ["tahun", "bulan", "kecamatan", "desa", "status_hamil", "keinginan", "jumlah"]
                             elif "jumlah_pra_ks" in cols_lower:
                                 key, req_cols = "pra_ks", ["tahun", "bulan", "kecamatan", "desa", "jumlah_pra_ks"]
-                            elif "status_hamil" in cols_lower:
-                                key, req_cols = "pus_bukan_kb", ["tahun", "bulan", "kecamatan", "desa", "status_hamil", "keinginan", "jumlah"]
+                            elif "jumlah_pus" in cols_lower:
+                                key, req_cols = "pus", ["tahun", "bulan", "kecamatan", "desa", "jumlah_pus"]
                             elif "metode" in cols_lower:
-                                # Could be total or baru - default total
-                                key, req_cols = "kb_total", ["tahun", "bulan", "kecamatan", "desa", "metode", "jumlah"]
+                                if "baru" in sheet_upper:
+                                    key, req_cols = "kb_baru", ["tahun", "bulan", "kecamatan", "desa", "metode", "jumlah"]
+                                else:
+                                    key, req_cols = "kb_total", ["tahun", "bulan", "kecamatan", "desa", "metode", "jumlah"]
                             else:
                                 results.append(f"❌ Sheet **{sheet}**: format tidak dikenali")
                                 continue
