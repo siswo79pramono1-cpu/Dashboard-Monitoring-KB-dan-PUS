@@ -637,7 +637,12 @@ elif menu == "🗺️ Peta Spasial":
         coloraxis_colorbar=dict(title=map_metric)
     )
     # Center on Batang
-    fig.update_mapboxes(center=dict(lat=-7.0, lon=109.85))
+    fig.update_layout(
+    map=dict(
+        center=dict(lat=-7.0, lon=109.85),
+        zoom=9.5
+    )
+)
     
     st.plotly_chart(fig, use_container_width=True)
     
