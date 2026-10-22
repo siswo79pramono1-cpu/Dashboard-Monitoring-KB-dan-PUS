@@ -7,6 +7,14 @@ import os
 from datetime import datetime
 from io import BytesIO
 
+# Google Sheets (opsional — aktif jika secrets tersedia)
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    HAS_GSPREAD = True
+except ImportError:
+    HAS_GSPREAD = False
+
 # ==================== PAGE CONFIG ====================
 st.set_page_config(
     page_title="Monitoring KB & PUS",
@@ -87,7 +95,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ==================== DATA PATHS ====================
+# ==================== DATA PATHS & STORAGE ====================
 DATA_DIR = "data_kb"
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -99,6 +107,44 @@ FILES = {
     "pus_bukan_kb": os.path.join(DATA_DIR, "pus_bukan_kb.csv"),
     "master": os.path.join(DATA_DIR, "master_wilayah.csv"),
 }
+
+# Nama worksheet di Google Sheets (harus sama)
+SHEET_NAMES = {
+    "pus": "PUS",
+    "kb_total": "KB_TOTAL",
+    "kb_baru": "KB_BARU",
+    "pra_ks": "PRA_KS",
+    "pus_bukan_kb": "PUS_BUKAN_KB",
+    "master": "MASTER",
+}
+
+def _use_sheets():
+    """Cek apakah Google Sheets dikonfigurasi di secrets."""
+    try:
+        return HAS_GSPREAD and "gcp_service_account" in st.secrets and "sheets" in st.secrets
+    except Exception:
+        return False
+
+@st.cache_resource(ttl=300)
+def _get_gspread_client():
+    creds_info = dict(st.secrets["gcp_service_account"])
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    credentials = Credentials.from_service_account_info(creds_info, scopes=scopes)
+    return gspread.authorize(credentials)
+
+def _get_spreadsheet():
+    client = _get_gspread_client()
+    sid = st.secrets["sheets"]["spreadsheet_id"]
+    return client.open_by_key(sid)
+
+def _get_or_create_worksheet(spreadsheet, title):
+    try:
+        return spreadsheet.worksheet(title)
+    except gspread.WorksheetNotFound:
+        return spreadsheet.add_worksheet(title=title, rows=1000, cols=20)
 
 METODE_KB = ["IUD", "MOP", "MOW", "IMP", "Suntik", "PIL", "Kondom", "MAL", "Tradisional"]
 
@@ -134,15 +180,57 @@ def init_master_wilayah():
     return pd.read_csv(FILES["master"])
 
 def load_data(key):
+    """Load data dari Google Sheets (jika dikonfigurasi) atau CSV lokal."""
+    if _use_sheets():
+        try:
+            ss = _get_spreadsheet()
+            ws = _get_or_create_worksheet(ss, SHEET_NAMES[key])
+            records = ws.get_all_records()
+            if not records:
+                return pd.DataFrame()
+            df = pd.DataFrame(records)
+            # Normalisasi tipe numerik
+            for col in df.columns:
+                if col in ("tahun", "bulan", "jumlah", "jumlah_pus", "jumlah_pra_ks"):
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            if "desa" in df.columns:
+                df["desa"] = df["desa"].fillna("").astype(str)
+                df.loc[df["desa"].isin(["nan", "None"]), "desa"] = ""
+            return df
+        except Exception as e:
+            st.warning(f"Gagal baca Google Sheets ({key}): {e}. Menggunakan data lokal.")
+    
+    # Fallback lokal
     path = FILES[key]
     if os.path.exists(path):
         try:
             return pd.read_csv(path)
-        except:
+        except Exception:
             return pd.DataFrame()
     return pd.DataFrame()
 
 def save_data(key, df):
+    """Simpan data ke Google Sheets (jika dikonfigurasi) dan/atau CSV lokal."""
+    df = df.copy()
+    # Pastikan desa string
+    if "desa" in df.columns:
+        df["desa"] = df["desa"].fillna("").astype(str)
+    
+    if _use_sheets():
+        try:
+            ss = _get_spreadsheet()
+            ws = _get_or_create_worksheet(ss, SHEET_NAMES[key])
+            ws.clear()
+            if df.empty:
+                return
+            # Header + values
+            values = [df.columns.tolist()] + df.astype(str).fillna("").values.tolist()
+            ws.update(values, value_input_option="USER_ENTERED")
+            return
+        except Exception as e:
+            st.error(f"Gagal simpan ke Google Sheets ({key}): {e}")
+            # tetap coba simpan lokal sebagai backup
+    
     df.to_csv(FILES[key], index=False)
 
 def get_kecamatan_list():
@@ -264,8 +352,13 @@ with st.sidebar:
         label_visibility="collapsed"
     )
     st.markdown("---")
-    st.caption("v2.1 • Import Excel + Spasial")
-    st.caption("Data tersimpan lokal / cloud")
+    if _use_sheets():
+        st.success("☁️ Google Sheets terhubung")
+        st.caption("Data tersimpan permanen")
+    else:
+        st.warning("💾 Mode lokal (data bisa hilang saat update)")
+        st.caption("Hubungkan Google Sheets agar data aman")
+    st.caption("v2.4 • Sheets + Import Excel + Spasial")
 
 # ==================== MENU: INPUT DATA ====================
 if menu == "📥 Input Data":
