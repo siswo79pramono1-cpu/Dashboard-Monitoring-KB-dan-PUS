@@ -428,7 +428,7 @@ if menu == "📥 Input Data":
 
 # ==================== MENU: DASHBOARD ====================
 elif menu == "📊 Dashboard":
-    st.subheader("📊 Dashboard Monitoring")
+    st.markdown("### 📊 Dashboard Monitoring KB & PUS")
     
     f1, f2, f3, f4 = st.columns(4)
     with f1:
@@ -455,7 +455,7 @@ elif menu == "📊 Dashboard":
     with f4:
         filter_kec = st.selectbox("Kecamatan", ["Semua"] + get_kecamatan_list(), key="dk")
     
-    st.markdown(f"#### 📅 {periode_label} {filter_tahun}" + (f" · {filter_kec}" if filter_kec != "Semua" else " · Semua Kecamatan"))
+    st.markdown(f"**📅 {periode_label} {filter_tahun}**" + (f" · {filter_kec}" if filter_kec != "Semua" else " · Semua Kecamatan"))
     
     df_pus = load_data("pus")
     df_kb_t = load_data("kb_total")
@@ -463,17 +463,14 @@ elif menu == "📊 Dashboard":
     df_pra = load_data("pra_ks")
     df_bukan = load_data("pus_bukan_kb")
     
-    # Data stok/akumulasi: ambil bulan terakhir dalam periode (bukan dijumlah per bulan)
-    # Data aliran (KB Baru): dijumlahkan sepanjang periode
     is_multi = len(filter_periode) > 1
-    
     if is_multi:
         pus_f = get_stock_df(df_pus, filter_tahun, filter_periode, filter_kec)
         kbt_f = get_stock_df(df_kb_t, filter_tahun, filter_periode, filter_kec)
         pra_f = get_stock_df(df_pra, filter_tahun, filter_periode, filter_kec)
         bukan_f = get_stock_df(df_bukan, filter_tahun, filter_periode, filter_kec)
-        kbb_f = filter_df(df_kb_b, filter_tahun, filter_periode, filter_kec)  # flow = sum
-        st.caption(f"📌 Mode periode multi-bulan: Data stok (PUS, KB Aktif, Pra KS, PUS Bukan KB) menampilkan **posisi bulan terakhir** dalam periode. KB Baru dijumlahkan sepanjang periode.")
+        kbb_f = filter_df(df_kb_b, filter_tahun, filter_periode, filter_kec)
+        st.caption("📌 Mode multi-bulan: data stok = posisi bulan terakhir · KB Baru = jumlah sepanjang periode")
     else:
         pus_f = filter_df(df_pus, filter_tahun, filter_periode, filter_kec)
         kbt_f = filter_df(df_kb_t, filter_tahun, filter_periode, filter_kec)
@@ -487,89 +484,203 @@ elif menu == "📊 Dashboard":
     total_pra = int(pra_f["jumlah_pra_ks"].sum()) if not pra_f.empty and "jumlah_pra_ks" in pra_f.columns else 0
     total_bukan = int(bukan_f["jumlah"].sum()) if not bukan_f.empty and "jumlah" in bukan_f.columns else 0
     coverage = (total_kb / total_pus * 100) if total_pus > 0 else 0
+    non_kb = max(total_pus - total_kb, 0)
     
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Total PUS", f"{total_pus:,}")
-    m2.metric("KB Aktif", f"{total_kb:,}", delta=f"{coverage:.1f}% coverage" if total_pus else None)
-    m3.metric("KB Baru", f"{total_baru:,}")
-    m4.metric("Pra KS", f"{total_pra:,}")
-    m5.metric("PUS Bukan KB", f"{total_bukan:,}")
+    total_unmet = 0
+    if not bukan_f.empty and "keinginan" in bukan_f.columns and "jumlah" in bukan_f.columns:
+        unmet_mask = bukan_f["keinginan"].astype(str).str.contains("NANTI|TIDAK INGIN", case=False, na=False, regex=True)
+        total_unmet = int(bukan_f.loc[unmet_mask, "jumlah"].sum())
+    unmet_pct = (total_unmet / total_pus * 100) if total_pus > 0 else 0
+    
+    # ===== BARIS METRIK ATAS =====
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    with c1:
+        st.metric("Total PUS", f"{total_pus:,}")
+    with c2:
+        st.metric("KB Aktif", f"{total_kb:,}", delta=f"{coverage:.1f}% coverage")
+    with c3:
+        st.metric("KB Baru", f"{total_baru:,}")
+    with c4:
+        st.metric("Pra KS", f"{total_pra:,}")
+    with c5:
+        st.metric("PUS Bukan KB", f"{total_bukan:,}")
+    with c6:
+        st.metric("Unmet Need", f"{total_unmet:,}", delta=f"{unmet_pct:.1f}% PUS")
     
     st.markdown("---")
     
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("##### 🔬 Distribusi Metode KB (Aktif)")
-        if not kbt_f.empty:
+    # ===== LAYOUT 3 KOLOM: Donut | Ranking | Detail =====
+    left, mid, right = st.columns([1.1, 1.2, 1.1])
+    
+    # --- KIRI: Donut charts ---
+    with left:
+        st.markdown("##### 👥 PUS")
+        if total_pus > 0:
+            fig_pus = go.Figure(data=[go.Pie(
+                labels=["Peserta KB", "Non-KB"],
+                values=[total_kb, non_kb],
+                hole=0.55,
+                marker_colors=["#22c55e", "#94a3b8"],
+                textinfo="percent+label",
+                textposition="outside"
+            )])
+            fig_pus.update_layout(
+                height=220, margin=dict(t=10, b=10, l=10, r=10),
+                showlegend=False, annotations=[dict(text=f"{total_pus:,}", x=0.5, y=0.5, font_size=16, showarrow=False)]
+            )
+            st.plotly_chart(fig_pus, use_container_width=True)
+        else:
+            st.info("Belum ada data PUS")
+        
+        st.markdown("##### 🔬 Peserta KB")
+        if not kbt_f.empty and total_kb > 0:
             msum = kbt_f.groupby("metode")["jumlah"].sum().reset_index()
-            msum = msum[msum["jumlah"] > 0]
-            if not msum.empty:
-                fig = px.pie(msum, values="jumlah", names="metode", hole=0.45,
-                             color_discrete_sequence=px.colors.qualitative.Set2)
-                fig.update_traces(textposition='inside', textinfo='percent+label')
-                fig.update_layout(height=380, margin=dict(t=20, b=20), showlegend=True)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Belum ada data")
+            msum = msum[msum["jumlah"] > 0].sort_values("jumlah", ascending=False)
+            fig_kb = go.Figure(data=[go.Pie(
+                labels=msum["metode"], values=msum["jumlah"], hole=0.55,
+                textinfo="percent", textposition="inside",
+                marker_colors=px.colors.qualitative.Set2
+            )])
+            fig_kb.update_layout(
+                height=240, margin=dict(t=10, b=10, l=10, r=10),
+                legend=dict(orientation="h", y=-0.15, font_size=10),
+                annotations=[dict(text=f"{total_kb:,}", x=0.5, y=0.5, font_size=14, showarrow=False)]
+            )
+            st.plotly_chart(fig_kb, use_container_width=True)
         else:
-            st.info("Belum ada data Peserta KB Total")
+            st.info("Belum ada data KB")
+        
+        st.markdown("##### 🚫 Bukan Peserta KB")
+        if not bukan_f.empty and total_bukan > 0:
+            if "status_hamil" in bukan_f.columns:
+                st_sum = bukan_f.groupby("status_hamil")["jumlah"].sum().reset_index()
+                fig_b = go.Figure(data=[go.Pie(
+                    labels=st_sum["status_hamil"], values=st_sum["jumlah"], hole=0.55,
+                    marker_colors=["#ef4444", "#3b82f6"],
+                    textinfo="percent+label", textposition="outside"
+                )])
+                fig_b.update_layout(
+                    height=220, margin=dict(t=10, b=10, l=10, r=10),
+                    showlegend=False,
+                    annotations=[dict(text=f"{total_bukan:,}", x=0.5, y=0.5, font_size=14, showarrow=False)]
+                )
+                st.plotly_chart(fig_b, use_container_width=True)
+            else:
+                st.info("Data tidak lengkap")
+        else:
+            st.info("Belum ada data")
     
-    with c2:
-        st.markdown("##### 🆕 Metode KB Baru")
-        if not kbb_f.empty:
+    # --- TENGAH: Ranking + Unmet ---
+    with mid:
+        st.markdown("##### 🏆 Peringkat Kecamatan (Coverage KB)")
+        
+        # Build ranking
+        if not pus_f.empty:
+            kec_p = pus_f.groupby("kecamatan", as_index=False)["jumlah_pus"].sum() if "jumlah_pus" in pus_f.columns else pd.DataFrame(columns=["kecamatan","jumlah_pus"])
+            kec_k = kbt_f.groupby("kecamatan", as_index=False)["jumlah"].sum().rename(columns={"jumlah":"kb_aktif"}) if (not kbt_f.empty and "jumlah" in kbt_f.columns) else pd.DataFrame(columns=["kecamatan","kb_aktif"])
+            rank = kec_p.merge(kec_k, on="kecamatan", how="left").fillna(0)
+            rank["coverage"] = rank.apply(lambda r: round(r["kb_aktif"]/r["jumlah_pus"]*100, 1) if r["jumlah_pus"]>0 else 0, axis=1)
+            rank = rank.sort_values("coverage", ascending=False).reset_index(drop=True)
+            rank["rank"] = rank.index + 1
+            
+            # Color bars for ranking
+            for i, row in rank.head(12).iterrows():
+                cov = row["coverage"]
+                color = "#22c55e" if cov >= 70 else ("#eab308" if cov >= 50 else "#ef4444")
+                st.markdown(
+                    f"""<div style="display:flex;align-items:center;margin-bottom:6px;background:#f8fafc;border-radius:8px;padding:6px 10px;border-left:4px solid {color}">
+                    <span style="width:28px;font-weight:700;color:#64748b">#{int(row['rank'])}</span>
+                    <span style="flex:1;font-weight:600;font-size:0.9rem">{row['kecamatan']}</span>
+                    <span style="font-weight:700;color:{color}">{cov:.1f}%</span>
+                    </div>""",
+                    unsafe_allow_html=True
+                )
+            if len(rank) > 12:
+                st.caption(f"... dan {len(rank)-12} kecamatan lainnya (lihat tabel bawah)")
+        else:
+            st.info("Belum ada data untuk ranking")
+        
+        st.markdown("##### 📉 Unmet Need")
+        st.markdown(
+            f"""<div style="background:linear-gradient(135deg,#fef2f2,#fff7ed);border-radius:12px;padding:16px;text-align:center;border:1px solid #fecaca">
+            <div style="font-size:2rem;font-weight:800;color:#dc2626">{total_unmet:,}</div>
+            <div style="color:#991b1b;font-size:0.9rem">Unmet Need ({unmet_pct:.1f}% dari PUS)</div>
+            <div style="color:#78716c;font-size:0.75rem;margin-top:4px">Ingin anak nanti + Tidak ingin anak lagi</div>
+            </div>""",
+            unsafe_allow_html=True
+        )
+    
+    # --- KANAN: Detail chart + KB Baru ---
+    with right:
+        st.markdown("##### 🆕 KB Baru per Metode")
+        if not kbb_f.empty and total_baru > 0:
             mbaru = kbb_f.groupby("metode")["jumlah"].sum().reset_index()
-            mbaru = mbaru[mbaru["jumlah"] > 0]
-            if not mbaru.empty:
-                fig = px.bar(mbaru, x="metode", y="jumlah", color="metode",
-                             color_discrete_sequence=px.colors.qualitative.Pastel)
-                fig.update_layout(height=380, showlegend=False, margin=dict(t=20, b=20))
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Belum ada data")
+            mbaru = mbaru[mbaru["jumlah"] > 0].sort_values("jumlah", ascending=True)
+            fig_baru = px.bar(mbaru, x="jumlah", y="metode", orientation="h",
+                              color="jumlah", color_continuous_scale="Tealgrn")
+            fig_baru.update_layout(height=280, margin=dict(t=10, b=10, l=10, r=10),
+                                   showlegend=False, coloraxis_showscale=False,
+                                   xaxis_title="", yaxis_title="")
+            st.plotly_chart(fig_baru, use_container_width=True)
         else:
-            st.info("Belum ada data Peserta KB Baru")
-    
-    st.markdown("##### 🚫 Detail PUS Bukan Peserta KB")
-    if not bukan_f.empty:
-        b1, b2 = st.columns(2)
-        with b1:
-            st_sum = bukan_f.groupby("status_hamil")["jumlah"].sum().reset_index()
-            fig = px.pie(st_sum, values="jumlah", names="status_hamil", hole=0.35,
-                         color_discrete_map={"Hamil": "#ef4444", "Tidak Hamil": "#3b82f6"})
-            fig.update_layout(height=320, title="Status Kehamilan")
-            st.plotly_chart(fig, use_container_width=True)
-        with b2:
+            st.info("Belum ada data KB Baru")
+        
+        st.markdown("##### 📋 Detail Bukan KB")
+        if not bukan_f.empty and "keinginan" in bukan_f.columns:
             det = bukan_f.groupby(["status_hamil", "keinginan"])["jumlah"].sum().reset_index()
-            fig = px.bar(det, x="keinginan", y="jumlah", color="status_hamil", barmode="group",
-                         color_discrete_map={"Hamil": "#ef4444", "Tidak Hamil": "#3b82f6"})
-            fig.update_layout(height=320, title="Keinginan menurut Status", xaxis_tickangle=-25)
-            st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Belum ada data PUS Bukan KB")
+            det = det.sort_values("jumlah", ascending=False)
+            fig_det = px.bar(det, x="keinginan", y="jumlah", color="status_hamil", barmode="group",
+                             color_discrete_map={"Hamil": "#ef4444", "Tidak Hamil": "#3b82f6"})
+            fig_det.update_layout(height=280, margin=dict(t=10, b=40, l=10, r=10),
+                                  xaxis_tickangle=-30, legend=dict(orientation="h", y=-0.35),
+                                  xaxis_title="", yaxis_title="")
+            st.plotly_chart(fig_det, use_container_width=True)
+        else:
+            st.info("Belum ada detail")
     
-    if filter_kec == "Semua" and not pus_f.empty:
-        st.markdown("##### 📍 Perbandingan antar Kecamatan")
-        kec_p = pus_f.groupby("kecamatan")["jumlah_pus"].sum().reset_index()
-        kec_k = kbt_f.groupby("kecamatan")["jumlah"].sum().reset_index() if not kbt_f.empty else pd.DataFrame(columns=["kecamatan", "jumlah"])
-        kec_k = kec_k.rename(columns={"jumlah": "kb_aktif"})
-        comp = kec_p.merge(kec_k, on="kecamatan", how="left").fillna(0)
-        comp["coverage"] = (comp["kb_aktif"] / comp["jumlah_pus"] * 100).round(1)
-        comp = comp.sort_values("jumlah_pus", ascending=False)
+    st.markdown("---")
+    
+    # ===== TABEL PER KECAMATAN =====
+    if not pus_f.empty:
+        st.markdown("##### 📍 Tabel Lengkap per Kecamatan")
+        kec_p = pus_f.groupby("kecamatan", as_index=False)["jumlah_pus"].sum() if "jumlah_pus" in pus_f.columns else pd.DataFrame(columns=["kecamatan", "jumlah_pus"])
+        kec_k = kbt_f.groupby("kecamatan", as_index=False)["jumlah"].sum().rename(columns={"jumlah": "kb_aktif"}) if (not kbt_f.empty and "jumlah" in kbt_f.columns) else pd.DataFrame(columns=["kecamatan", "kb_aktif"])
+        kec_baru = kbb_f.groupby("kecamatan", as_index=False)["jumlah"].sum().rename(columns={"jumlah": "kb_baru"}) if (not kbb_f.empty and "jumlah" in kbb_f.columns) else pd.DataFrame(columns=["kecamatan", "kb_baru"])
+        kec_pra = pra_f.groupby("kecamatan", as_index=False)["jumlah_pra_ks"].sum() if (not pra_f.empty and "jumlah_pra_ks" in pra_f.columns) else pd.DataFrame(columns=["kecamatan", "jumlah_pra_ks"])
+        kec_bukan = bukan_f.groupby("kecamatan", as_index=False)["jumlah"].sum().rename(columns={"jumlah": "pus_bukan_kb"}) if (not bukan_f.empty and "jumlah" in bukan_f.columns) else pd.DataFrame(columns=["kecamatan", "pus_bukan_kb"])
         
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        fig.add_trace(go.Bar(x=comp["kecamatan"], y=comp["jumlah_pus"], name="PUS",
-                             marker_color="#10b981"), secondary_y=False)
-        fig.add_trace(go.Scatter(x=comp["kecamatan"], y=comp["coverage"], name="Coverage %",
-                                 mode="lines+markers", marker_color="#ef4444", line=dict(width=3)), secondary_y=True)
-        fig.update_layout(height=400, title="PUS vs Coverage KB")
-        fig.update_yaxes(title_text="Jumlah PUS", secondary_y=False)
-        fig.update_yaxes(title_text="Coverage (%)", secondary_y=True)
-        st.plotly_chart(fig, use_container_width=True)
+        if not bukan_f.empty and "keinginan" in bukan_f.columns:
+            unmet_df = bukan_f[bukan_f["keinginan"].astype(str).str.contains("NANTI|TIDAK INGIN", case=False, na=False, regex=True)]
+            kec_unmet = unmet_df.groupby("kecamatan", as_index=False)["jumlah"].sum().rename(columns={"jumlah": "unmet_need"}) if not unmet_df.empty else pd.DataFrame(columns=["kecamatan", "unmet_need"])
+        else:
+            kec_unmet = pd.DataFrame(columns=["kecamatan", "unmet_need"])
         
-        st.dataframe(comp.rename(columns={
-            "kecamatan": "Kecamatan", "jumlah_pus": "Total PUS",
-            "kb_aktif": "KB Aktif", "coverage": "Coverage (%)"
-        }), use_container_width=True, hide_index=True)
+        comp = kec_p.merge(kec_k, on="kecamatan", how="outer")
+        comp = comp.merge(kec_baru, on="kecamatan", how="outer")
+        comp = comp.merge(kec_pra, on="kecamatan", how="outer")
+        comp = comp.merge(kec_bukan, on="kecamatan", how="outer")
+        comp = comp.merge(kec_unmet, on="kecamatan", how="outer").fillna(0)
+        
+        for col in ["jumlah_pus", "kb_aktif", "kb_baru", "jumlah_pra_ks", "pus_bukan_kb", "unmet_need"]:
+            if col in comp.columns:
+                comp[col] = comp[col].astype(int)
+        
+        comp["coverage"] = comp.apply(lambda r: round(r["kb_aktif"] / r["jumlah_pus"] * 100, 1) if r["jumlah_pus"] > 0 else 0, axis=1)
+        comp["unmet_pct"] = comp.apply(lambda r: round(r["unmet_need"] / r["jumlah_pus"] * 100, 1) if r["jumlah_pus"] > 0 else 0, axis=1)
+        comp = comp.sort_values("coverage", ascending=False)
+        
+        show_df = comp.rename(columns={
+            "kecamatan": "Kecamatan", "jumlah_pus": "PUS", "kb_aktif": "KB Aktif",
+            "coverage": "Coverage (%)", "kb_baru": "KB Baru", "jumlah_pra_ks": "Pra KS",
+            "pus_bukan_kb": "PUS Bukan KB", "unmet_need": "Unmet Need", "unmet_pct": "Unmet Need (%)"
+        })
+        st.dataframe(show_df, use_container_width=True, hide_index=True)
+        
+        csv_kec = show_df.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download Tabel per Kecamatan (CSV)", data=csv_kec,
+                           file_name=f"perbandingan_kecamatan_{filter_tahun}.csv", mime="text/csv")
+    else:
+        st.info("Belum ada data PUS. Silakan input atau import data terlebih dahulu.")
 
 # ==================== MENU: PETA SPASIAL ====================
 elif menu == "🗺️ Peta Spasial":
