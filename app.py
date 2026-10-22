@@ -915,15 +915,20 @@ elif menu == "🗺️ Peta Spasial":
     
     if map_metric == "Jumlah PUS":
         size_col, color_col, title = "size_plot", "jumlah_pus", "Jumlah PUS per Kecamatan"
-        color_scale = "Greens"
+        color_scale = ["#fef3c7", "#f59e0b", "#dc2626", "#7f1d1d"]  # kuning → merah (kontras di peta hijau)
     elif map_metric == "Peserta KB Aktif":
-        map_df["size_plot"] = map_df["kb_aktif"].apply(lambda x: max(x, 1))
+        map_df["size_plot"] = map_df["kb_aktif"].apply(lambda x: max(int(x), 1))
         size_col, color_col, title = "size_plot", "kb_aktif", "Peserta KB Aktif per Kecamatan"
-        color_scale = "Blues"
+        color_scale = ["#dbeafe", "#3b82f6", "#1d4ed8", "#1e3a8a"]  # biru terang → tua
     else:
-        map_df["size_plot"] = map_df["coverage"].apply(lambda x: max(x, 1))
+        map_df["size_plot"] = map_df["coverage"].apply(lambda x: max(float(x), 1))
         size_col, color_col, title = "size_plot", "coverage", "Coverage KB (%) per Kecamatan"
-        color_scale = "RdYlGn"
+        color_scale = ["#fecaca", "#f97316", "#22c55e", "#166534"]  # merah → hijau
+    
+    # Label hanya untuk yang punya data > 0, agar tidak ramai
+    map_df["label"] = map_df.apply(
+        lambda r: r["kecamatan"] if r["jumlah_pus"] > 0 or r["kb_aktif"] > 0 else "", axis=1
+    )
     
     fig = px.scatter_map(
         map_df,
@@ -931,6 +936,7 @@ elif menu == "🗺️ Peta Spasial":
         lon="lon",
         size=size_col,
         color=color_col,
+        text="label",
         hover_name="kecamatan",
         hover_data={
             "jumlah_pus": True,
@@ -938,15 +944,21 @@ elif menu == "🗺️ Peta Spasial":
             "coverage": True,
             "lat": False,
             "lon": False,
-            "size_plot": False
+            "size_plot": False,
+            "label": False
         },
         color_continuous_scale=color_scale,
-        size_max=45,
-        zoom=9.5,
+        size_max=55,
+        zoom=9.8,
         title=title,
-        map_style="open-street-map",
-        height=520,
-        center={"lat": -7.0, "lon": 109.85}
+        map_style="carto-positron",  # peta lebih polos, marker lebih jelas
+        height=560,
+        center={"lat": -6.98, "lon": 109.88}
+    )
+    fig.update_traces(
+        textposition="top center",
+        textfont=dict(size=11, color="#0f172a", family="Arial Black"),
+        marker=dict(opacity=0.85)
     )
     fig.update_layout(
         margin=dict(l=0, r=0, t=40, b=0),
