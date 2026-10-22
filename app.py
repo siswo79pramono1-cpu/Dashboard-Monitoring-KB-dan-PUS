@@ -179,26 +179,46 @@ def init_master_wilayah():
         pd.DataFrame(data).to_csv(FILES["master"], index=False)
     return pd.read_csv(FILES["master"])
 
+@st.cache_data(ttl=120, show_spinner=False)
+def _load_all_sheets():
+    """Ambil semua sheet sekali, lalu cache 2 menit — hemat kuota API."""
+    result = {}
+    if not _use_sheets():
+        return result
+    try:
+        ss = _get_spreadsheet()
+        for key, title in SHEET_NAMES.items():
+            try:
+                ws = _get_or_create_worksheet(ss, title)
+                records = ws.get_all_records()
+                if records:
+                    df = pd.DataFrame(records)
+                    for col in df.columns:
+                        if col in ("tahun", "bulan", "jumlah", "jumlah_pus", "jumlah_pra_ks"):
+                            df[col] = pd.to_numeric(df[col], errors="coerce")
+                    if "desa" in df.columns:
+                        df["desa"] = df["desa"].fillna("").astype(str)
+                        df.loc[df["desa"].isin(["nan", "None"]), "desa"] = ""
+                    result[key] = df
+                else:
+                    result[key] = pd.DataFrame()
+            except Exception:
+                result[key] = pd.DataFrame()
+    except Exception as e:
+        # Jangan spam warning tiap key
+        st.session_state["_sheets_error"] = str(e)
+    return result
+
 def load_data(key):
-    """Load data dari Google Sheets (jika dikonfigurasi) atau CSV lokal."""
+    """Load data dari Google Sheets (cache) atau CSV lokal."""
     if _use_sheets():
-        try:
-            ss = _get_spreadsheet()
-            ws = _get_or_create_worksheet(ss, SHEET_NAMES[key])
-            records = ws.get_all_records()
-            if not records:
-                return pd.DataFrame()
-            df = pd.DataFrame(records)
-            # Normalisasi tipe numerik
-            for col in df.columns:
-                if col in ("tahun", "bulan", "jumlah", "jumlah_pus", "jumlah_pra_ks"):
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-            if "desa" in df.columns:
-                df["desa"] = df["desa"].fillna("").astype(str)
-                df.loc[df["desa"].isin(["nan", "None"]), "desa"] = ""
-            return df
-        except Exception as e:
-            st.warning(f"Gagal baca Google Sheets ({key}): {e}. Menggunakan data lokal.")
+        all_data = _load_all_sheets()
+        if key in all_data:
+            return all_data[key].copy()
+        err = st.session_state.get("_sheets_error")
+        if err and not st.session_state.get("_sheets_err_shown"):
+            st.warning(f"Gagal baca Google Sheets: {err}. Menggunakan data lokal.")
+            st.session_state["_sheets_err_shown"] = True
     
     # Fallback lokal
     path = FILES[key]
@@ -210,9 +230,8 @@ def load_data(key):
     return pd.DataFrame()
 
 def save_data(key, df):
-    """Simpan data ke Google Sheets (jika dikonfigurasi) dan/atau CSV lokal."""
+    """Simpan data ke Google Sheets dan clear cache agar data baru terbaca."""
     df = df.copy()
-    # Pastikan desa string
     if "desa" in df.columns:
         df["desa"] = df["desa"].fillna("").astype(str)
     
@@ -221,15 +240,16 @@ def save_data(key, df):
             ss = _get_spreadsheet()
             ws = _get_or_create_worksheet(ss, SHEET_NAMES[key])
             ws.clear()
-            if df.empty:
-                return
-            # Header + values
-            values = [df.columns.tolist()] + df.astype(str).fillna("").values.tolist()
-            ws.update(values, value_input_option="USER_ENTERED")
+            if not df.empty:
+                values = [df.columns.tolist()] + df.astype(str).fillna("").values.tolist()
+                ws.update(values, value_input_option="USER_ENTERED")
+            # Hapus cache supaya baca ulang data terbaru
+            _load_all_sheets.clear()
+            st.session_state.pop("_sheets_error", None)
+            st.session_state.pop("_sheets_err_shown", None)
             return
         except Exception as e:
             st.error(f"Gagal simpan ke Google Sheets ({key}): {e}")
-            # tetap coba simpan lokal sebagai backup
     
     df.to_csv(FILES[key], index=False)
 
@@ -253,11 +273,17 @@ def add_desa(kecamatan, desa):
         master.to_csv(FILES["master"], index=False)
 
 def filter_df(df, tahun, bulan_list, kecamatan):
-    if df.empty:
-        return df
-    mask = (df["tahun"] == tahun) & (df["bulan"].isin(bulan_list))
-    if kecamatan != "Semua":
-        mask = mask & (df["kecamatan"] == kecamatan)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    # pastikan kolom ada
+    if "tahun" not in df.columns or "bulan" not in df.columns:
+        return pd.DataFrame()
+    df["tahun"] = pd.to_numeric(df["tahun"], errors="coerce")
+    df["bulan"] = pd.to_numeric(df["bulan"], errors="coerce")
+    mask = (df["tahun"] == int(tahun)) & (df["bulan"].isin([int(b) for b in bulan_list]))
+    if kecamatan != "Semua" and "kecamatan" in df.columns:
+        mask = mask & (df["kecamatan"].astype(str).str.strip().str.lower() == str(kecamatan).strip().lower())
     return df[mask]
 
 def get_stock_df(df, tahun, bulan_list, kecamatan):
@@ -807,7 +833,22 @@ elif menu == "🗺️ Peta Spasial":
     df_pus = load_data("pus")
     df_kb = load_data("kb_total")
     
-    # Multi-bulan: ambil posisi bulan terakhir (stok)
+    # Normalisasi nama kolom & tipe
+    def _prep(df):
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.copy()
+        df.columns = [str(c).strip().lower() for c in df.columns]
+        if "kecamatan" in df.columns:
+            df["kecamatan"] = df["kecamatan"].astype(str).str.strip()
+        for col in ("tahun", "bulan", "jumlah", "jumlah_pus"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+    
+    df_pus = _prep(df_pus)
+    df_kb = _prep(df_kb)
+    
     if len(map_bulan) > 1:
         pus_map = get_stock_df(df_pus, map_tahun, map_bulan, "Semua")
         kb_map = get_stock_df(df_kb, map_tahun, map_bulan, "Semua")
@@ -815,10 +856,17 @@ elif menu == "🗺️ Peta Spasial":
         pus_map = filter_df(df_pus, map_tahun, map_bulan, "Semua")
         kb_map = filter_df(df_kb, map_tahun, map_bulan, "Semua")
     
+    # Lookup kecamatan case-insensitive
+    def _sum_kec(df, kec, col):
+        if df is None or df.empty or col not in df.columns or "kecamatan" not in df.columns:
+            return 0
+        mask = df["kecamatan"].astype(str).str.strip().str.lower() == kec.strip().lower()
+        return int(pd.to_numeric(df.loc[mask, col], errors="coerce").fillna(0).sum())
+    
     rows = []
     for kec, coord in KOORDINAT_KECAMATAN.items():
-        p = int(pus_map[pus_map["kecamatan"]==kec]["jumlah_pus"].sum()) if not pus_map.empty else 0
-        k = int(kb_map[kb_map["kecamatan"]==kec]["jumlah"].sum()) if not kb_map.empty else 0
+        p = _sum_kec(pus_map, kec, "jumlah_pus")
+        k = _sum_kec(kb_map, kec, "jumlah")
         cov = (k / p * 100) if p > 0 else 0
         rows.append({
             "kecamatan": kec,
@@ -826,16 +874,39 @@ elif menu == "🗺️ Peta Spasial":
             "lon": coord["lon"],
             "jumlah_pus": p,
             "kb_aktif": k,
-            "coverage": round(cov, 1)
+            "coverage": round(cov, 1),
+            "size_plot": max(p, 1)  # agar titik tetap terlihat
         })
     
     map_df = pd.DataFrame(rows)
+    total_p = int(map_df["jumlah_pus"].sum())
+    total_k = int(map_df["kb_aktif"].sum())
     
     c1, c2, c3 = st.columns(3)
-    c1.metric("Total PUS (Peta)", f"{map_df['jumlah_pus'].sum():,}")
-    c2.metric("Total KB Aktif", f"{map_df['kb_aktif'].sum():,}")
-    avg_cov = map_df[map_df['jumlah_pus']>0]['coverage'].mean() if (map_df['jumlah_pus']>0).any() else 0
+    c1.metric("Total PUS (Peta)", f"{total_p:,}")
+    c2.metric("Total KB Aktif", f"{total_k:,}")
+    avg_cov = map_df[map_df["jumlah_pus"] > 0]["coverage"].mean() if total_p > 0 else 0
     c3.metric("Rata-rata Coverage", f"{avg_cov:.1f}%")
+    
+    # Diagnostik jika data kosong
+    if total_p == 0:
+        st.warning("⚠️ Data PUS untuk periode ini kosong di peta. Cek diagnosa di bawah.")
+        with st.expander("🔍 Diagnosa Data", expanded=True):
+            st.write(f"**Baris mentah PUS (semua periode):** {len(df_pus)}")
+            st.write(f"**Baris mentah KB Total:** {len(df_kb)}")
+            if not df_pus.empty:
+                st.write("**Kolom PUS:**", list(df_pus.columns))
+                if "tahun" in df_pus.columns:
+                    st.write("**Tahun tersedia:**", sorted(df_pus["tahun"].dropna().unique().tolist()))
+                if "bulan" in df_pus.columns:
+                    st.write("**Bulan tersedia:**", sorted(df_pus["bulan"].dropna().unique().tolist()))
+                if "kecamatan" in df_pus.columns:
+                    st.write("**Kecamatan di data:**", sorted(df_pus["kecamatan"].dropna().astype(str).str.strip().unique().tolist()))
+                st.write("**Sample 5 baris PUS:**")
+                st.dataframe(df_pus.head(5), use_container_width=True)
+            else:
+                st.error("Sheet PUS kosong. Silakan **Import Excel** atau input data dulu, lalu pastikan tersimpan di Google Sheets.")
+            st.info("Pastikan nama kecamatan di data sama dengan: " + ", ".join(list(KOORDINAT_KECAMATAN.keys())[:5]) + ", ...")
     
     st.markdown("---")
     
@@ -843,13 +914,15 @@ elif menu == "🗺️ Peta Spasial":
                           ["Jumlah PUS", "Peserta KB Aktif", "Coverage (%)"], horizontal=True)
     
     if map_metric == "Jumlah PUS":
-        size_col, color_col, title = "jumlah_pus", "jumlah_pus", "Jumlah PUS per Kecamatan"
+        size_col, color_col, title = "size_plot", "jumlah_pus", "Jumlah PUS per Kecamatan"
         color_scale = "Greens"
     elif map_metric == "Peserta KB Aktif":
-        size_col, color_col, title = "kb_aktif", "kb_aktif", "Peserta KB Aktif per Kecamatan"
+        map_df["size_plot"] = map_df["kb_aktif"].apply(lambda x: max(x, 1))
+        size_col, color_col, title = "size_plot", "kb_aktif", "Peserta KB Aktif per Kecamatan"
         color_scale = "Blues"
     else:
-        size_col, color_col, title = "coverage", "coverage", "Coverage KB (%) per Kecamatan"
+        map_df["size_plot"] = map_df["coverage"].apply(lambda x: max(x, 1))
+        size_col, color_col, title = "size_plot", "coverage", "Coverage KB (%) per Kecamatan"
         color_scale = "RdYlGn"
     
     fig = px.scatter_map(
@@ -864,7 +937,8 @@ elif menu == "🗺️ Peta Spasial":
             "kb_aktif": True,
             "coverage": True,
             "lat": False,
-            "lon": False
+            "lon": False,
+            "size_plot": False
         },
         color_continuous_scale=color_scale,
         size_max=45,
@@ -881,7 +955,7 @@ elif menu == "🗺️ Peta Spasial":
     
     st.plotly_chart(fig, use_container_width=True)
     
-    with st.expander("📋 Data Tabel per Kecamatan", expanded=False):
+    with st.expander("📋 Data Tabel per Kecamatan", expanded=True):
         st.dataframe(
             map_df[["kecamatan", "jumlah_pus", "kb_aktif", "coverage"]]
             .rename(columns={
